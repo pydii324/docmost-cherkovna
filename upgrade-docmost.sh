@@ -1,5 +1,7 @@
 #!/bin/bash
 
+cd "$(dirname "$0")" || exit 1
+
 echo "Stopping Docmost containers..."
 docker compose stop docmost
 
