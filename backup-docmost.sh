@@ -12,23 +12,8 @@ DB_BACKUP_FILE="$DB_BACKUP_DIR/docmost_${TIMESTAMP}.sql.gz"
 STORAGE_BACKUP_FILE="$STORAGE_BACKUP_DIR/docmost-storage_${TIMESTAMP}.tar.gz"
 DB_TMP_FILE="$DB_BACKUP_FILE.tmp"
 STORAGE_TMP_FILE="$STORAGE_BACKUP_FILE.tmp"
-STORAGE_TMP_BASENAME="$(basename "$STORAGE_TMP_FILE")"
 
 mkdir -p "$DB_BACKUP_DIR" "$STORAGE_BACKUP_DIR"
-
-DOCMOST_CONTAINER_ID="$(docker compose -f "$COMPOSE_FILE" ps -q docmost)"
-
-if [[ -z "$DOCMOST_CONTAINER_ID" ]]; then
-  echo "Docmost container is not running. Start the stack before running backups." >&2
-  exit 1
-fi
-
-STORAGE_VOLUME_NAME="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/data/storage"}}{{.Name}}{{end}}{{end}}' "$DOCMOST_CONTAINER_ID")"
-
-if [[ -z "$STORAGE_VOLUME_NAME" ]]; then
-  echo "Could not determine the storage volume mounted at /app/data/storage." >&2
-  exit 1
-fi
 
 echo "Backing up database to $DB_BACKUP_FILE"
 docker compose -f "$COMPOSE_FILE" exec -T db sh -lc '
@@ -37,13 +22,27 @@ docker compose -f "$COMPOSE_FILE" exec -T db sh -lc '
 ' | gzip > "$DB_TMP_FILE"
 mv "$DB_TMP_FILE" "$DB_BACKUP_FILE"
 
-echo "Backing up storage volume $STORAGE_VOLUME_NAME to $STORAGE_BACKUP_FILE"
+echo "Backing up Garage bucket to $STORAGE_BACKUP_FILE"
+EXPORT_DIR="$(mktemp -d "$STORAGE_BACKUP_DIR/export.XXXXXX")"
+trap 'rm -rf "$EXPORT_DIR"' EXIT
+
 docker run --rm \
+  --network docmost_default \
   --user "$(id -u):$(id -g)" \
-  -v "$STORAGE_VOLUME_NAME:/source:ro" \
-  -v "$STORAGE_BACKUP_DIR:/backup" \
-  alpine:3.20 \
-  sh -lc 'tar -czf "/backup/$1" -C /source .' sh "$STORAGE_TMP_BASENAME"
+  --env-file "$PROJECT_DIR/.env" \
+  -v "$EXPORT_DIR:/export" \
+  --entrypoint /bin/sh \
+  rclone/rclone:1.72.0 -c '
+    export RCLONE_CONFIG_GG_TYPE=s3 \
+           RCLONE_CONFIG_GG_PROVIDER=Other \
+           RCLONE_CONFIG_GG_ENDPOINT="$AWS_S3_ENDPOINT" \
+           RCLONE_CONFIG_GG_REGION="$AWS_S3_REGION" \
+           RCLONE_CONFIG_GG_ACCESS_KEY_ID="$AWS_S3_ACCESS_KEY_ID" \
+           RCLONE_CONFIG_GG_SECRET_ACCESS_KEY="$AWS_S3_SECRET_ACCESS_KEY" \
+           RCLONE_CONFIG_GG_FORCE_PATH_STYLE=true
+    rclone copy "GG:$AWS_S3_BUCKET" /export'
+
+tar -czf "$STORAGE_TMP_FILE" -C "$EXPORT_DIR" .
 mv "$STORAGE_TMP_FILE" "$STORAGE_BACKUP_FILE"
 
 find "$DB_BACKUP_DIR" -type f -name 'docmost_*.sql.gz' -mtime +$RETENTION_DAYS -delete
